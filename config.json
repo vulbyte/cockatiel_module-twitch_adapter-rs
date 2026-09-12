@@ -1,0 +1,12 @@
+{
+  "engine_port": ,
+  "module_specific": {
+    "channel": "",
+    "client_id": "",
+    "oauth_token": "",
+    "username": ""
+  },
+  "pairing_pin": ,
+  "priority": 100,
+  "process_position": ""
+}

@@ -1,0 +1,12 @@
+{
+    "name": "twitch-adapter", 
+    "description": "a module for getting and sending messages to twitch",
+    "version": "0.1.0", 
+    "capabilities": "input",    
+    "root_file": "./src/main.rs",
+    "launch_command": "cargo run",
+    "command_flags": [
+        " --release"
+    ],
+    "autostart": true
+}
