@@ -1,12 +1,65 @@
 {
-    "name": "twitch-adapter", 
-    "description": "a module for getting and sending messages to twitch",
-    "version": "0.1.0", 
-    "capabilities": "input",    
-    "root_file": "./src/main.rs",
-    "launch_command": "cargo run",
-    "command_flags": [
-        " --release"
-    ],
-    "autostart": true
+  "name": "twitch-adapter",
+  "description": "a module for getting and sending messages to twitch",
+  "version": "0.1.0",
+  "capabilities": "input",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": [
+    "--release"
+  ],
+  "autostart": true,
+  "credentials": [
+    {
+      "key": "channel",
+      "label": "Channel",
+      "sensitive": false,
+      "list": false,
+      "env": ""
+    },
+    {
+      "key": "client_id",
+      "label": "Client ID (dev.twitch.tv)",
+      "sensitive": true,
+      "list": false,
+      "env": "TWITCH_CLIENT_ID"
+    },
+    {
+      "key": "username",
+      "label": "Bot Username",
+      "sensitive": false,
+      "list": false,
+      "env": ""
+    },
+    {
+      "key": "oauth_token",
+      "label": "OAuth Token (auto-acquired)",
+      "sensitive": true,
+      "list": false,
+      "optional": true,
+      "env": "TWITCH_OAUTH_TOKEN"
+    }
+  ],
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/twitch-adapter-rs",
+      "aarch64": "target/release/twitch-adapter-rs",
+      "arm": "target/release/twitch-adapter-rs"
+    },
+    "linux": {
+      "x86_64": "target/release/twitch-adapter-rs",
+      "aarch64": "target/release/twitch-adapter-rs",
+      "arm": "target/release/twitch-adapter-rs"
+    },
+    "windows": {
+      "x86_64": "target/release/twitch-adapter-rs.exe",
+      "aarch64": "target/release/twitch-adapter-rs.exe",
+      "arm": "target/release/twitch-adapter-rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
 }

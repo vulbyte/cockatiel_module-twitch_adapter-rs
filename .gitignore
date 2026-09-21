@@ -193,3 +193,7 @@ target/
 *.tmp
 *.bak
 
+
+# Runtime config — contains secrets (tokens/oauth). Never commit.
+config.json
+.env
