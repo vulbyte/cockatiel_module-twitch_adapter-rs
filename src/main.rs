@@ -137,6 +137,20 @@ fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json:
     None
 }
 
+/// Loopback port for the OAuth redirect listener. Read from the top-level
+/// `oauth_redirect_port` key in config.json (default 3000, so existing
+/// platform-console registrations keep working).
+fn load_oauth_redirect_port() -> u16 {
+    std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|v| v.get("oauth_redirect_port").cloned())
+        .and_then(|p| p.as_u64())
+        .filter(|p| (1..=u16::MAX as u64).contains(p))
+        .map(|p| p as u16)
+        .unwrap_or(3000)
+}
+
 fn load_adapter_config() -> Option<TwitchAdapterConfig> {
     // Secrets live in `.env` (loaded into env at startup); `channel` and
     // `username` are public settings, read from config.json below.
@@ -212,9 +226,10 @@ async fn capture_oauth_token_concurrent(
     module_name: &str,
     instance_uuid: &str,
     client_id: &str,
+    oauth_redirect_port: u16,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:3000").await?;
-    let redirect_uri = "http://localhost:3000";
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", oauth_redirect_port)).await?;
+    let redirect_uri = format!("http://localhost:{}", oauth_redirect_port);
     let auth_url = format!(
         "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope=chat:read+chat:edit",
         client_id, redirect_uri
@@ -223,7 +238,7 @@ async fn capture_oauth_token_concurrent(
     println!("\n--------------------------------------------------");
     println!("  Opening browser for official Twitch authorization...");
     println!("  Ensure your Redirect URI in the Twitch Developer");
-    println!("  Console is set to exactly: http://localhost:3000");
+    println!("  Console is set to exactly: {}", redirect_uri);
     println!("--------------------------------------------------\n");
 
     let _ = open::that(&auth_url);
@@ -250,13 +265,13 @@ async fn capture_oauth_token_concurrent(
             let _ = socket.write_all(response_html.as_bytes()).await;
             Ok(token)
         } else if request.contains("error=") {
-            let response_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+            let response_html = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
             <html><body style='background:#0e0e10;color:#efeff1;font-family:system-ui,sans-serif;text-align:center;padding-top:120px;'>\
             <h1 style='color:#ff4f4f;'>Twitch Redirect Error (Mismatch)</h1>\
-            <p>Please check that your Redirect URI in the Twitch Developer Console is set to exactly <b>http://localhost:3000</b>.</p>\
-            </body></html>";
+            <p>Please check that your Redirect URI in the Twitch Developer Console is set to exactly <b>{}</b>.</p>\
+            </body></html>", redirect_uri);
             let _ = socket.write_all(response_html.as_bytes()).await;
-            Err("Twitch returned a redirect_mismatch error. Make sure http://localhost:3000 is added under Redirect URIs in your Twitch Console app settings.".into())
+            Err(format!("Twitch returned a redirect_mismatch error. Make sure {} is added under Redirect URIs in your Twitch Console app settings.", redirect_uri).into())
         } else {
             // Serve landing page with JS to extract window.location.hash and forward to /callback
             let landing_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
@@ -325,7 +340,7 @@ async fn capture_oauth_token_concurrent(
                 Some(input) => {
                     let m_trimmed = input.trim();
                     if m_trimmed.contains("error=") {
-                        return Err(format!("Twitch auth error detected. Ensure your Redirect URI in the Twitch Console is set strictly to 'http://localhost:3000'. Details: {}", m_trimmed).into());
+                        return Err(format!("Twitch auth error detected. Ensure your Redirect URI in the Twitch Console is set strictly to '{}'. Details: {}", redirect_uri, m_trimmed).into());
                     }
 
                     let raw_token = if let Some(idx) = m_trimmed.find("access_token=") {
@@ -441,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_token = cockatiel.auth_token.clone();
     let instance_uuid = cockatiel.instance_uuid7.clone();
     let module_name = cockatiel.config.module_name.clone();
+    let oauth_redirect_port = load_oauth_redirect_port();
 
     // Channel for outbound SendToPlatforms messages → Twitch IRC writer.
     let (send_outbound_tx, mut send_outbound_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -647,16 +663,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &module_name,
                 &instance_uuid,
                 "Twitch Client ID Required",
-                "Paste your Twitch Client ID (or press Enter for anonymous read-only).\n\n\
+                &format!("Paste your Twitch Client ID (or press Enter for anonymous read-only).\n\n\
                  To create one:\n\
                  1. Go to https://dev.twitch.tv/console/apps\n\
                  2. Click 'Register Your Application'.\n\
                  3. Settings:\n\
                     - Name: tiel-bot (nsfw words are banned)\n\
-                    - OAuth Redirect URI: http://localhost:3000\n\
+                    - OAuth Redirect URI: http://localhost:{}\n\
                     - Set the client type to public\n\
                     - Category: Chat Bot\n\
-                 4. Click 'Create' and copy your Client ID.",
+                 4. Click 'Create' and copy your Client ID.", oauth_redirect_port),
                 "Twitch Client ID (or blank for anonymous)",
                 PromptKind::String,
                 300,
@@ -672,6 +688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &module_name,
                     &instance_uuid,
                     &client_id,
+                    oauth_redirect_port,
                 )
                 .await
                 {
@@ -725,6 +742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &module_name,
             &instance_uuid,
             &client_id,
+            oauth_redirect_port,
         );
         match tokio::time::timeout(std::time::Duration::from_secs(90), capture).await {
             Ok(Ok(raw_token)) => {
