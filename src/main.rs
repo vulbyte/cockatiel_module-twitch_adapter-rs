@@ -937,6 +937,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             raw_message: message_text.clone(),
                                             user_uuid7: author_name.to_string(),
                                             command: None,
+                                            channel_id: channel.clone(),
                                             user_data: None,
                                         }),
                                     };
