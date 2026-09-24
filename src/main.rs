@@ -20,6 +20,60 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     WsMessage,
 >;
 
+/// The module's engine-session identity (auth token + assigned instance + name).
+/// Held in a shared Mutex so a reconnect can swap it in place and every other
+/// task (read loop, platform send path) always uses the CURRENT session's
+/// credentials — a stale token after a reconnect would be rejected by the
+/// engine and the module would look dead.
+#[derive(Clone, Default)]
+struct EngineIdentity {
+    auth: String,
+    instance: String,
+    module: String,
+}
+
+/// Re-register the adapter's chat commands with the engine (called on the
+/// initial connect AND after every reconnect — the engine forgets a session's
+/// commands when the socket drops).
+async fn register_commands(
+    write: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let commands = Container {
+        version: 1,
+        auth_token: auth.clone(),
+        module_name: module.clone(),
+        module_instance_uuid7: instance.clone(),
+        payload: Some(Payload::CommandsPayload(Commands {
+            commands: vec![
+                Command {
+                    command_name: "ban".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "ban a user".to_string(),
+                    command_flags: vec![],
+                },
+                Command {
+                    command_name: "timeout".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "timeout a user".to_string(),
+                    command_flags: vec![],
+                },
+            ],
+            alert_on_unknown_command: false,
+        })),
+    };
+    let mut cbuf = Vec::new();
+    if commands.encode(&mut cbuf).is_ok() {
+        let mut w = write.lock().await;
+        let _ = w.send(WsMessage::Binary(cbuf.into())).await;
+    }
+    info!("registered !ban / !timeout commands");
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct TwitchAdapterConfig {
     channel: Option<String>,
@@ -217,7 +271,7 @@ async fn fetch_twitch_username(raw_token: &str) -> Option<String> {
 }
 
 async fn capture_oauth_token_concurrent(
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -366,8 +420,13 @@ async fn capture_oauth_token_concurrent(
 
 /// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
 /// operator's response (`PromptResponse.reason`). Returns None on cancel/timeout.
+///
+/// The write lock is taken ONLY to send the prompt and released before waiting
+/// for the answer — holding it across the wait would block the read loop's
+/// AuthVerify reply and make the module look unresponsive to the engine's
+/// liveness probe (which severs it).
 async fn prompt_for_input(
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -409,8 +468,11 @@ async fn prompt_for_input(
     if container.encode(&mut buf).is_err() {
         return None;
     }
-    if write_ws.send(WsMessage::Binary(buf.into())).await.is_err() {
-        return None;
+    {
+        let mut w = write_ws.lock().await;
+        if w.send(WsMessage::Binary(buf.into())).await.is_err() {
+            return None;
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64 + 10);
@@ -464,7 +526,7 @@ fn tie_choices_help() -> String {
 /// Ask the operator how to handle an invalid channel: (t)ry / (i)gnore /
 /// (r)emove / (e)dit. Re-prompts until a valid choice (or None on cancel).
 async fn prompt_tie_choice(
-    write_ws: &mut WsWriteHalf,
+    write_ws: &tokio::sync::Mutex<WsWriteHalf>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
@@ -535,49 +597,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cockatiel = CockatielClient::connect("config.json").await?;
 
     // Split the stream for concurrent read/write
-    let (write_ws_cockatiel, mut read_ws_cockatiel) = cockatiel.stream.split();
+    let (write_ws_cockatiel, read_ws_cockatiel) = cockatiel.stream.split();
     let write_ws_cockatiel = Arc::new(tokio::sync::Mutex::new(write_ws_cockatiel));
-    let auth_token = cockatiel.auth_token.clone();
-    let instance_uuid = cockatiel.instance_uuid7.clone();
-    let module_name = cockatiel.config.module_name.clone();
+    // Shared session identity: the read loop AND the platform send path read
+    // the CURRENT token/instance here, so a reconnect (which swaps this) never
+    // leaves stale credentials behind.
+    let identity: Arc<tokio::sync::Mutex<EngineIdentity>> = Arc::new(tokio::sync::Mutex::new(
+        EngineIdentity {
+            auth: cockatiel.auth_token.clone(),
+            instance: cockatiel.instance_uuid7.clone(),
+            module: cockatiel.config.module_name.clone(),
+        },
+    ));
     let oauth_redirect_port = load_oauth_redirect_port();
+
+    // Initial identity, used by the (one-time) setup phase prompts. Runtime
+    // sends read the CURRENT identity from the shared handle instead.
+    let (auth_token, instance_uuid, module_name) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.instance.clone(), id.module.clone())
+    };
 
     // Register the mod commands with the engine command system: the engine now
     // parses `!ban` / `!timeout` and routes them back here with the parsed
     // Command attached to `ChatMessage.command`.
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let commands = Container {
-            version: 1,
-            auth_token: auth_token.clone(),
-            module_name: module_name.clone(),
-            module_instance_uuid7: instance_uuid.clone(),
-            payload: Some(Payload::CommandsPayload(Commands {
-                commands: vec![
-                    Command {
-                        command_name: "ban".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "ban a user".to_string(),
-                        command_flags: vec![],
-                    },
-                    Command {
-                        command_name: "timeout".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "timeout a user".to_string(),
-                        command_flags: vec![],
-                    },
-                ],
-                alert_on_unknown_command: false,
-            })),
-        };
-        let mut cbuf = Vec::new();
-        use prost::Message;
-        if commands.encode(&mut cbuf).is_ok() {
-            let mut w = write_ws_cockatiel.lock().await;
-            let _ = w.send(WsMessage::Binary(cbuf.into())).await;
-        }
-        info!("registered !ban / !timeout commands");
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    register_commands(&write_ws_cockatiel, &identity).await;
 
     // Channel for outbound SendToPlatforms messages → Twitch IRC writer.
     let (send_outbound_tx, mut send_outbound_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -587,89 +632,129 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
     let prompt_tx_task = prompt_tx.clone();
     let write_task = write_ws_cockatiel.clone();
-    let auth_task = auth_token.clone();
-    let module_task = module_name.clone();
-    let instance_task = instance_uuid.clone();
+    let identity_task = identity.clone();
 
     tokio::spawn(async move {
-        while let Some(msg) = read_ws_cockatiel.next().await {
-            match msg {
-                Ok(WsMessage::Binary(data)) => {
-                    if let Ok(container) = cockatiel_client::proto::Container::decode(data.as_ref()) {
-                        info!("Received from engine: {:?}", container.payload.as_ref().map(|p| std::mem::discriminant(p)));
+        // Read-loop + engine-session supervisor. When the socket drops the
+        // module RECONNECTS instead of going zombie on a dead socket (the old
+        // behavior: the platform loop kept pushing into a dead WS forever).
+        let mut read = read_ws_cockatiel;
+        loop {
+            // Read until the connection dies.
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(WsMessage::Binary(data)) => {
+                        if let Ok(container) = cockatiel_client::proto::Container::decode(data.as_ref()) {
+                            info!("Received from engine: {:?}", container.payload.as_ref().map(|p| std::mem::discriminant(p)));
 
-                        // Answer the engine's liveness probe with our auth token
-                        // so a quiet period never severs us.
-                        if let Some(Payload::AuthVerify(_)) = container.payload {
-                            let reply = Container {
-                                version: 1,
-                                auth_token: auth_task.clone(),
-                                module_name: module_task.clone(),
-                                module_instance_uuid7: instance_task.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
-                                    cur_auth: auth_task.clone(),
-                                })),
+                            // Use the CURRENT session identity (a reconnect swaps it).
+                            let (auth, instance, module) = {
+                                let id = identity_task.lock().await;
+                                (id.auth.clone(), id.instance.clone(), id.module.clone())
                             };
-                            let mut buf = Vec::new();
-                            if reply.encode(&mut buf).is_ok() {
-                                let mut w = write_task.lock().await;
-                                let _ = w.send(WsMessage::Binary(buf.into())).await;
-                            }
-                        }
-                        // Handle outbound SendToPlatforms: forward the message to
-                        // the Twitch IRC writer over a channel.
-                        else if let Some(Payload::SendToPlatforms(send)) = container.payload {
-                            if let Err(e) = send_outbound_tx.send(send.msg.clone()).await {
-                                error!("Twitch outbound channel closed; dropping message: {}", e);
-                            }
-                        } else if let Some(Payload::PromptResponse(resp)) = container.payload {
-                            // Forward operator answers to the awaiting prompt.
-                            let _ = prompt_tx_task.send(resp);
-                        }
-                        // Routed chat command: the engine parsed `!ban` / `!timeout`
-                        // and delivered it here (the owning module) with the parsed
-                        // Command attached. Reuse the same mod-query logic.
-                        else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
-                            let Some(chat) = pre.raw_message else { continue };
-                            let Some(cmd) = chat.command else { continue };
-                            if cmd.command_name != "ban" && cmd.command_name != "timeout" {
-                                continue;
-                            }
-                            let author = chat
-                                .user_data
-                                .as_ref()
-                                .map(|u| u.username.clone())
-                                .unwrap_or_default();
-                            if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
-                                let query = Container {
+
+                            // Answer the engine's liveness probe with our auth token
+                            // so a quiet period never severs us.
+                            if let Some(Payload::AuthVerify(_)) = container.payload {
+                                let reply = Container {
                                     version: 1,
-                                    auth_token: auth_task.clone(),
-                                    module_name: module_task.clone(),
-                                    module_instance_uuid7: instance_task.clone(),
-                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
-                                        query_id: qid,
-                                        sql: payload.to_string(),
-                                        params: vec![],
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
+                                    payload: Some(Payload::AuthVerify(AuthVerify {
+                                        cur_auth: auth.clone(),
                                     })),
                                 };
-                                let mut qbuf = Vec::new();
-                                if query.encode(&mut qbuf).is_ok() {
+                                let mut buf = Vec::new();
+                                if reply.encode(&mut buf).is_ok() {
                                     let mut w = write_task.lock().await;
-                                    let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                    let _ = w.send(WsMessage::Binary(buf.into())).await;
+                                }
+                            }
+                            // Handle outbound SendToPlatforms: forward the message to
+                            // the Twitch IRC writer over a channel.
+                            else if let Some(Payload::SendToPlatforms(send)) = container.payload {
+                                if let Err(e) = send_outbound_tx.send(send.msg.clone()).await {
+                                    error!("Twitch outbound channel closed; dropping message: {}", e);
+                                }
+                            } else if let Some(Payload::PromptResponse(resp)) = container.payload {
+                                // Forward operator answers to the awaiting prompt.
+                                let _ = prompt_tx_task.send(resp);
+                            }
+                            // Routed chat command: the engine parsed `!ban` / `!timeout`
+                            // and delivered it here (the owning module) with the parsed
+                            // Command attached. Reuse the same mod-query logic.
+                            else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
+                                let Some(chat) = pre.raw_message else { continue };
+                                let Some(cmd) = chat.command else { continue };
+                                if cmd.command_name != "ban" && cmd.command_name != "timeout" {
+                                    continue;
+                                }
+                                let author = chat
+                                    .user_data
+                                    .as_ref()
+                                    .map(|u| u.username.clone())
+                                    .unwrap_or_default();
+                                if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
+                                    let query = Container {
+                                        version: 1,
+                                        auth_token: auth.clone(),
+                                        module_name: module.clone(),
+                                        module_instance_uuid7: instance.clone(),
+                                        payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                            query_id: qid,
+                                            sql: payload.to_string(),
+                                            params: vec![],
+                                        })),
+                                    };
+                                    let mut qbuf = Vec::new();
+                                    if query.encode(&mut qbuf).is_ok() {
+                                        let mut w = write_task.lock().await;
+                                        let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                    }
                                 }
                             }
                         }
                     }
+                    Ok(WsMessage::Close(_)) => {
+                        info!("Engine closed connection");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Engine WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
                 }
-                Ok(WsMessage::Close(_)) => {
-                    info!("Engine closed connection");
-                    break;
+            }
+
+            // The engine connection dropped — reconnect with backoff instead of
+            // leaving the platform loop pushing into a dead socket.
+            info!("Engine disconnected — reconnecting...");
+            let mut backoff = 1u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                match CockatielClient::connect("config.json").await {
+                    Ok(conn) => {
+                        info!("Reconnected to engine");
+                        let (w, r) = conn.stream.split();
+                        *write_task.lock().await = w;
+                        *identity_task.lock().await = EngineIdentity {
+                            auth: conn.auth_token,
+                            instance: conn.instance_uuid7,
+                            module: conn.config.module_name,
+                        };
+                        // The engine forgets a session's commands when the
+                        // socket drops — re-register on the fresh session.
+                        register_commands(&write_task, &identity_task).await;
+                        read = r;
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                        backoff = (backoff * 2).min(30);
+                    }
                 }
-                Err(e) => {
-                    error!("Engine WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
             }
         }
     });
@@ -748,7 +833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(saved) = load_adapter_config() {
             if let Some(saved_chan) = saved.channel {
                 let confirm = prompt_for_input(
-                    &mut *write_ws_cockatiel.lock().await,
+                    &write_ws_cockatiel,
                     &mut prompt_rx,
                     &auth_token,
                     &module_name,
@@ -781,7 +866,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if channel.is_empty() {
         let input = prompt_for_input(
-            &mut *write_ws_cockatiel.lock().await,
+            &write_ws_cockatiel,
             &mut prompt_rx,
             &auth_token,
             &module_name,
@@ -813,7 +898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if !channel.is_empty() && oauth_token.is_empty() {
             let client_id_input = prompt_for_input(
-                &mut *write_ws_cockatiel.lock().await,
+                &write_ws_cockatiel,
                 &mut prompt_rx,
                 &auth_token,
                 &module_name,
@@ -838,7 +923,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !client_id.is_empty() {
                 match capture_oauth_token_concurrent(
-                    &mut *write_ws_cockatiel.lock().await,
+                    &write_ws_cockatiel,
                     &mut prompt_rx,
                     &auth_token,
                     &module_name,
@@ -892,9 +977,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the browser OAuth flow using the saved client_id. Bounded by a timeout
         // so it can never hang forever; on failure we fall back to read-only.
         println!("\n  Opening browser to authorize the bot on Twitch...");
-        let mut ws_guard = write_ws_cockatiel.lock().await;
+        // No write lock is held across the OAuth wait — that would block the
+        // read loop's AuthVerify reply and get this module killed by the
+        // engine's liveness probe. prompt_for_input locks only for the send.
         let capture = capture_oauth_token_concurrent(
-            &mut *ws_guard,
+            &write_ws_cockatiel,
             &mut prompt_rx,
             &auth_token,
             &module_name,
@@ -954,7 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let subject = format!("Channel '{}' does not exist on Twitch.", channel);
             let choice = prompt_tie_choice(
-                &mut *write_ws_cockatiel.lock().await,
+                &write_ws_cockatiel,
                 &mut prompt_rx,
                 &auth_token,
                 &module_name,
@@ -974,7 +1061,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(TieChoice::Remove) => {
                     setup_log.push_str(&format!("channel '{}' invalid — removed\n", channel));
                     if let Some(val) = prompt_for_input(
-                        &mut *write_ws_cockatiel.lock().await,
+                        &write_ws_cockatiel,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
@@ -1003,7 +1090,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(TieChoice::Edit) => {
                     if let Some(val) = prompt_for_input(
-                        &mut *write_ws_cockatiel.lock().await,
+                        &write_ws_cockatiel,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
@@ -1160,11 +1247,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }),
                                     };
 
+                                    // Read the CURRENT session identity (a reconnect
+                                    // swaps it) so sends work after a reconnect.
+                                    let (auth, module, instance) = {
+                                        let id = identity.lock().await;
+                                        (id.auth.clone(), id.module.clone(), id.instance.clone())
+                                    };
                                     let container = cockatiel_client::proto::Container {
                                         version: 1,
-                                        auth_token: auth_token.clone(),
-                                        module_name: module_name.clone(),
-                                        module_instance_uuid7: instance_uuid.clone(),
+                                        auth_token: auth,
+                                        module_name: module,
+                                        module_instance_uuid7: instance,
                                         payload: Some(Payload::MessagePreProcess(pre_process_msg)),
                                     };
                                     let mut buf = Vec::new();
