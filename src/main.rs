@@ -434,6 +434,93 @@ async fn prompt_for_input(
     None
 }
 
+/// The operator's choice when the configured Twitch channel is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TieChoice {
+    /// Re-test the same channel (the failure may be transient).
+    Retry,
+    /// Keep the channel but skip validation for now (noted in the log).
+    Ignore,
+    /// Drop the channel and prompt for a new one.
+    Remove,
+    /// Prompt for a corrected channel and re-test.
+    Edit,
+}
+
+fn parse_tie_choice(answer: &str) -> Option<TieChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "t" | "try" | "retry" | "try again" => Some(TieChoice::Retry),
+        "i" | "ignore" => Some(TieChoice::Ignore),
+        "r" | "remove" => Some(TieChoice::Remove),
+        "e" | "edit" => Some(TieChoice::Edit),
+        _ => None,
+    }
+}
+
+fn tie_choices_help() -> String {
+    "Enter one of: (t)ry again, (i)gnore, (r)emove, (e)dit".to_string()
+}
+
+/// Ask the operator how to handle an invalid channel: (t)ry / (i)gnore /
+/// (r)emove / (e)dit. Re-prompts until a valid choice (or None on cancel).
+async fn prompt_tie_choice(
+    write_ws: &mut WsWriteHalf,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    subject: &str,
+) -> Option<TieChoice> {
+    loop {
+        let answer = prompt_for_input(
+            write_ws,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Invalid Twitch Entry",
+            &format!("{}\n\n{}", subject, tie_choices_help()),
+            "t / i / r / e",
+            PromptKind::String,
+            300,
+        )
+        .await;
+        match answer.as_deref().and_then(parse_tie_choice) {
+            Some(c) => return Some(c),
+            None if answer.is_some() => {
+                warn!("Unrecognized choice — expected t / i / r / e.");
+            }
+            None => return None, // cancelled
+        }
+    }
+}
+
+/// Check whether a Twitch channel exists via the Helix users endpoint. Returns
+/// true when the API responds 200 with a non-empty `data` array.
+async fn channel_exists(
+    client: &reqwest::Client,
+    client_id: &str,
+    oauth: &str,
+    channel: &str,
+) -> bool {
+    let res = client
+        .get(format!("https://api.twitch.tv/helix/users?login={}", channel))
+        .header("Client-Id", client_id)
+        .header("Authorization", format!("Bearer {}", oauth))
+        .send()
+        .await
+        .ok();
+    let Some(res) = res else { return false; };
+    if !res.status().is_success() {
+        return false;
+    }
+    let Ok(json) = res.json::<serde_json::Value>().await else { return false; };
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -630,6 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut oauth_token = env_oauth.clone();
         let mut username = env_username.clone();
         let mut client_id = env_client_id.clone();
+        let mut setup_log = String::new();
 
         // Non-interactive fast path: if a saved config exists, use it without
         // prompting (enables the TUI to supply credentials via file). Just the
@@ -717,12 +805,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 channel = trimmed.to_string();
             }
         } else {
-            warn!("No channel provided. Re-prompting...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue 'configure;
+            // Never loop on the operator: a cancelled channel prompt leaves the
+            // module idle (receive-only) instead of re-prompting forever.
+            warn!("No channel provided — the module will idle until configured.");
+            setup_log.push_str("no channel provided — the module will idle until configured\n");
         }
 
-        if oauth_token.is_empty() {
+        if !channel.is_empty() && oauth_token.is_empty() {
             let client_id_input = prompt_for_input(
                 &mut *write_ws_cockatiel.lock().await,
                 &mut prompt_rx,
@@ -782,7 +871,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if username.is_empty() {
+        if !channel.is_empty() && username.is_empty() {
             username = if oauth_token.is_empty() {
                 let unique_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -795,7 +884,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
 
-        save_adapter_config(&channel, &oauth_token, &username, &client_id);
+        if !channel.is_empty() {
+            save_adapter_config(&channel, &oauth_token, &username, &client_id);
+        }
     } else if oauth_token.is_empty() && !client_id.is_empty() {
         // Channel is configured but we don't have a token yet — acquire it via
         // the browser OAuth flow using the saved client_id. Bounded by a timeout
@@ -836,6 +927,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => {
                 warn!("OAuth capture timed out after 90s. Connecting in read-only mode.");
             }
+        }
+    }
+
+    // ── Linear setup phase: validate the acquired channel ────────────────
+    // The channel comes from env/saved config/prompt. Validate it against the
+    // Twitch Helix API and let the operator make an explicit t/i/r/e choice on
+    // invalid channels instead of looping on the prompts. Anonymous mode (no
+    // client_id/token) cannot be verified — connect anyway.
+    if !channel.is_empty() {
+        let http_client = reqwest::Client::new();
+        'validate: loop {
+            if client_id.is_empty() || oauth_token.is_empty() {
+                info!("channel '{}' cannot be verified anonymously — connecting anyway", channel);
+                setup_log.push_str(&format!(
+                    "channel '{}' cannot be verified anonymously — connecting anyway\n",
+                    channel
+                ));
+                break 'validate;
+            }
+
+            if channel_exists(&http_client, &client_id, &oauth_token, &channel).await {
+                setup_log.push_str(&format!("channel '{}' is valid\n", channel));
+                break 'validate;
+            }
+
+            let subject = format!("Channel '{}' does not exist on Twitch.", channel);
+            let choice = prompt_tie_choice(
+                &mut *write_ws_cockatiel.lock().await,
+                &mut prompt_rx,
+                &auth_token,
+                &module_name,
+                &instance_uuid,
+                &subject,
+            )
+            .await;
+            match choice {
+                Some(TieChoice::Retry) => continue 'validate,
+                Some(TieChoice::Ignore) => {
+                    setup_log.push_str(&format!(
+                        "channel '{}' invalid — ignored (will retry at runtime)\n",
+                        channel
+                    ));
+                    break 'validate;
+                }
+                Some(TieChoice::Remove) => {
+                    setup_log.push_str(&format!("channel '{}' invalid — removed\n", channel));
+                    if let Some(val) = prompt_for_input(
+                        &mut *write_ws_cockatiel.lock().await,
+                        &mut prompt_rx,
+                        &auth_token,
+                        &module_name,
+                        &instance_uuid,
+                        "Twitch Live Chat Configuration Required",
+                        "Enter the Twitch channel name or stream link to connect to.",
+                        "Twitch channel name or stream link",
+                        PromptKind::String,
+                        300,
+                    )
+                    .await
+                    {
+                        let trimmed = val.trim();
+                        if let Some(idx) = trimmed.find("twitch.tv/") {
+                            channel = trimmed[idx + 10..]
+                                .split('/')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                        } else {
+                            channel = trimmed.to_string();
+                        }
+                        continue 'validate;
+                    }
+                    break 'validate;
+                }
+                Some(TieChoice::Edit) => {
+                    if let Some(val) = prompt_for_input(
+                        &mut *write_ws_cockatiel.lock().await,
+                        &mut prompt_rx,
+                        &auth_token,
+                        &module_name,
+                        &instance_uuid,
+                        "Edit Twitch Channel",
+                        "Enter the corrected Twitch channel name or stream link.",
+                        "Twitch channel name or stream link",
+                        PromptKind::String,
+                        300,
+                    )
+                    .await
+                    {
+                        let trimmed = val.trim();
+                        if let Some(idx) = trimmed.find("twitch.tv/") {
+                            channel = trimmed[idx + 10..]
+                                .split('/')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                        } else {
+                            channel = trimmed.to_string();
+                        }
+                        continue 'validate;
+                    }
+                    break 'validate;
+                }
+                None => {
+                    setup_log.push_str(&format!(
+                        "channel '{}' invalid — skipped (cancelled)\n",
+                        channel
+                    ));
+                    break 'validate;
+                }
+            }
+        }
+    }
+
+    // Surface the setup summary to the operator (the accumulated log).
+    if !setup_log.trim().is_empty() {
+        let log = Container {
+            version: 1,
+            auth_token: auth_token.clone(),
+            module_name: module_name.clone(),
+            module_instance_uuid7: instance_uuid.clone(),
+            payload: Some(Payload::Log(cockatiel_client::proto::Log {
+                log: format!("[twitch-adapter] setup:\n{}", setup_log.trim_end()),
+                blob: vec![],
+            })),
+        };
+        let mut lbuf = Vec::new();
+        if log.encode(&mut lbuf).is_ok() {
+            let mut w = write_ws_cockatiel.lock().await;
+            let _ = w.send(WsMessage::Binary(lbuf)).await;
         }
     }
 
@@ -1018,5 +1239,21 @@ mod tests {
         assert_eq!(qid, "mod_timeout");
         // An unrouted command name yields nothing.
         assert!(build_mod_query("!help", "!help", "mod").is_none());
+    }
+
+    #[test]
+    fn tie_choice_parses_all_options() {
+        assert_eq!(parse_tie_choice("t"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("retry"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try again"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("i"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("r"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("e"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("Remove"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("TRY AGAIN"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("x"), None);
+        assert_eq!(parse_tie_choice(""), None);
     }
 }
