@@ -205,6 +205,10 @@ fn load_oauth_redirect_port() -> u16 {
 fn load_adapter_config() -> Option<TwitchAdapterConfig> {
     // Secrets live in `.env` (loaded into env at startup); `channel` and
     // `username` are public settings, read from config.json below.
+    // A saved config is loadable when it has a channel (a deliberately
+    // anonymous / read-only `justinfan` setup has NO oauth/client_id and must
+    // still reload) OR actual credentials. Only a genuinely empty config (no
+    // channel AND no creds) is treated as "no config" → None.
     let saved = std::fs::read_to_string("config.json")
         .ok()
         .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
@@ -225,8 +229,10 @@ fn load_adapter_config() -> Option<TwitchAdapterConfig> {
         client_id: Some(std::env::var("TWITCH_CLIENT_ID").unwrap_or_default()),
     })
     .filter(|c| {
-        !c.oauth_token.as_deref().unwrap_or("").is_empty()
-            && !c.client_id.as_deref().unwrap_or("").is_empty()
+        let has_channel = !c.channel.as_deref().unwrap_or("").is_empty();
+        let has_creds = !c.oauth_token.as_deref().unwrap_or("").is_empty()
+            && !c.client_id.as_deref().unwrap_or("").is_empty();
+        has_channel || has_creds
     })
 }
 
@@ -672,10 +678,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             // Handle outbound SendToPlatforms: forward the message to
-                            // the Twitch IRC writer over a channel.
+                            // the Twitch IRC writer over a channel. The IRC select! arm
+                            // is the ONLY consumer and is NOT running during the
+                            // configure/setup phase or every Twitch reconnect sleep —
+                            // a blocking `.await send()` would let engine replies fill
+                            // the queue and stall the read loop (missed AuthVerify →
+                            // killed). Never block here: try_send, and on overflow drop
+                            // the newest with a rate warning.
                             else if let Some(Payload::SendToPlatforms(send)) = container.payload {
-                                if let Err(e) = send_outbound_tx.send(send.msg.clone()).await {
-                                    error!("Twitch outbound channel closed; dropping message: {}", e);
+                                if let Err(e) = send_outbound_tx.try_send(send.msg.clone()) {
+                                    match e {
+                                        tokio::sync::mpsc::error::TrySendError::Full(_) => warn!(
+                                            "Twitch outbound queue full (64) — dropping newest engine reply (rate limit / Twitch down); read loop stays responsive"
+                                        ),
+                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                            error!("Twitch outbound channel closed; dropping message")
+                                        }
+                                    }
                                 }
                             } else if let Some(Payload::PromptResponse(resp)) = container.payload {
                                 // Forward operator answers to the awaiting prompt.
@@ -686,7 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Command attached. Reuse the same mod-query logic.
                             else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
                                 let Some(chat) = pre.raw_message else { continue };
-                                let Some(cmd) = chat.command else { continue };
+                                let Some(cmd) = chat.command.clone() else { continue };
                                 if cmd.command_name != "ban" && cmd.command_name != "timeout" {
                                     continue;
                                 }
@@ -712,6 +731,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let mut w = write_task.lock().await;
                                         let _ = w.send(WsMessage::Binary(qbuf.into())).await;
                                     }
+                                } else {
+                                    warn!(
+                                        "Routed '{}' command not parsed from '{}' — acking without action",
+                                        cmd.command_name, chat.raw_message
+                                    );
+                                }
+                                // Ack the pre-process stage with the SAME message_uuid7
+                                // (echo the raw ChatMessage back, carrying the current
+                                // session identity exactly like the other sends) so the
+                                // engine releases the command instead of stranding it
+                                // until the timeout sweep.
+                                let ack = Container {
+                                    version: 1,
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
+                                    payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                                        audio: pre.audio,
+                                        audio_type: pre.audio_type,
+                                        message_uuid7: pre.message_uuid7,
+                                        raw_message: Some(chat),
+                                    })),
+                                };
+                                let mut abuf = Vec::new();
+                                if ack.encode(&mut abuf).is_ok() {
+                                    let mut w = write_task.lock().await;
+                                    let _ = w.send(WsMessage::Binary(abuf)).await;
                                 }
                             }
                         }
@@ -765,7 +811,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cockatiel_client::load_env_file(".env");
     // `channel`/`username` are public → config.json; oauth/client_id are
     // secrets → .env (env vars).
-    let env_channel = std::env::var("TWITCH_CHANNEL")
+    // `env_channel`/`env_oauth` are cleared on Twitch credential rejection so
+    // the next `'configure` pass actually re-prompts instead of re-cloning the
+    // rejected values from this one-time snapshot.
+    let mut env_channel = std::env::var("TWITCH_CHANNEL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
@@ -777,7 +826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|c| c.as_str().map(|s| s.to_string()))
         })
         .unwrap_or_default();
-    let env_oauth = std::env::var("TWITCH_OAUTH_TOKEN").unwrap_or_default();
+    let mut env_oauth = std::env::var("TWITCH_OAUTH_TOKEN").unwrap_or_default();
     let env_username = std::env::var("TWITCH_USERNAME")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -922,7 +971,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client_id = client_id_input.unwrap_or_default().trim().to_string();
 
             if !client_id.is_empty() {
-                match capture_oauth_token_concurrent(
+                // Bounded by an outer timeout like the re-acquire path below: if
+                // the browser flow AND the operator both stall, the main thread
+                // must not wait here forever during setup.
+                let capture = capture_oauth_token_concurrent(
                     &write_ws_cockatiel,
                     &mut prompt_rx,
                     &auth_token,
@@ -930,10 +982,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &instance_uuid,
                     &client_id,
                     oauth_redirect_port,
-                )
-                .await
-                {
-                    Ok(raw_token) => {
+                );
+                match tokio::time::timeout(std::time::Duration::from_secs(120), capture).await {
+                    Ok(Ok(raw_token)) => {
                         let clean_token = raw_token.strip_prefix("oauth:").unwrap_or(&raw_token);
                         oauth_token = format!("oauth:{}", clean_token);
 
@@ -949,8 +1000,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         info!("Successfully acquired and configured OAuth token!");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!("Token capture failed: {}", e);
+                    }
+                    Err(_) => {
+                        warn!("OAuth capture timed out after 120s — no token acquired; connect will proceed without one");
                     }
                 }
             }
@@ -1147,6 +1201,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if channel.is_empty() {
+        // A cancelled channel prompt leaves no channel: DON'T enter the
+        // JOIN/reconnect spin (it would send `JOIN #` and reconnect every 5s
+        // forever). Exit cleanly so the supervisor can restart the module once
+        // a configuration exists.
+        error!(
+            "No Twitch channel configured after setup — exiting cleanly (supervisor will restart once config exists)."
+        );
+        return Ok(());
+    }
+
     let twitch_ws_url = "wss://irc-ws.chat.twitch.tv:443";
 
         'reconnect: loop {
@@ -1218,6 +1283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     oauth_token.clear();
                                     username.clear();
                                     client_id.clear();
+                                    // Clear the startup env snapshot too, otherwise
+                                    // the next 'configure pass re-clones the rejected
+                                    // token/channel and the module loops reject →
+                                    // t/i/r/e → reconnect → reject forever.
+                                    env_channel.clear();
+                                    env_oauth.clear();
                                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                     continue 'configure;
                                 }
