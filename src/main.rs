@@ -237,13 +237,19 @@ fn load_oauth_redirect_port() -> u16 {
         .unwrap_or(3000)
 }
 
-/// Backfill any missing tunables into `module_specific` with their defaults,
-/// so every setting is always present and editable in place. Leaves
-/// `channel`/`username` (managed by save_adapter_config) untouched.
 fn backfill_adapter_config_defaults() {
-    let path = PathBuf::from("config.json");
-    let Ok(data) = std::fs::read_to_string(&path) else { return; };
-    let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&data) else { return; };
+    backfill_adapter_config_defaults_at(&std::path::PathBuf::from("config.json"));
+}
+
+/// Backfill any missing tunables into `module_specific` with their defaults
+/// (creating config.json if it does not exist yet), so every setting is always
+/// present and editable in place. Leaves `channel`/`username` (managed by
+/// save_adapter_config) untouched.
+fn backfill_adapter_config_defaults_at(path: &std::path::Path) {
+    let mut json_val = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
     let mut ms = json_val
         .get("module_specific")
         .cloned()
@@ -268,7 +274,7 @@ fn backfill_adapter_config_defaults() {
     if ms != before {
         json_val["module_specific"] = ms;
         if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
-            let _ = std::fs::write(&path, pretty);
+            let _ = std::fs::write(path, pretty);
         }
     }
 }
@@ -319,15 +325,24 @@ fn save_adapter_config(channel: &str, oauth_token: &str, username: &str, client_
         ],
     );
     let path = PathBuf::from("config.json");
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&data) {
-            json_val["module_specific"] = json!({ "channel": channel, "username": username });
-            if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
-                let _ = std::fs::write(&path, pretty);
-                info!("Successfully saved Twitch configuration (secrets → .env)");
-            }
-        }
+    let mut json_val = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Merge channel/username in WITHOUT clobbering the tuning knobs, so a
+    // re-configure never resets tuned values back to their defaults.
+    if json_val.get("module_specific").and_then(|v| v.as_object()).is_none() {
+        json_val["module_specific"] = serde_json::json!({});
     }
+    let ms = json_val["module_specific"].as_object_mut().unwrap();
+    ms.insert("channel".to_string(), serde_json::json!(channel));
+    ms.insert("username".to_string(), serde_json::json!(username));
+    if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
+        let _ = std::fs::write(&path, pretty);
+        info!("Successfully saved Twitch configuration (secrets → .env)");
+    }
+    // Ensure the tuning knobs exist on disk even on a first run.
+    backfill_adapter_config_defaults();
 }
 
 /// Automatically queries Twitch's /validate endpoint to get the exact lowercase username
@@ -1532,5 +1547,46 @@ mod tests {
         assert_eq!(parse_tie_choice("TRY AGAIN"), Some(TieChoice::Retry));
         assert_eq!(parse_tie_choice("x"), None);
         assert_eq!(parse_tie_choice(""), None);
+    }
+
+    #[test]
+    fn backfill_creates_defaults_and_preserves_existing() {
+        let dir = std::env::temp_dir().join(format!("twitch_backfill_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // Missing file: backfill creates it with every tuning default.
+        backfill_adapter_config_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ms = root["module_specific"].as_object().unwrap();
+        assert_eq!(ms["default_timeout_secs"], 300);
+        assert_eq!(ms["prompt_timeout_secs"], 300);
+        assert_eq!(ms["oauth_capture_timeout_secs"], 120);
+        assert_eq!(ms["outbound_queue_cap"], 64);
+        assert_eq!(ms["reconnect_base_secs"], 1);
+        assert_eq!(ms["reconnect_max_secs"], 30);
+        assert_eq!(ms["irc_connect_retry_secs"], 5);
+        assert_eq!(ms["cred_rejection_cooldown_secs"], 2);
+        assert_eq!(ms["irc_reconnect_delay_secs"], 5);
+        assert_eq!(ms.len(), 9, "all tuning defaults present");
+
+        // Existing values preserved, missing keys added, top-level fields survive.
+        std::fs::write(
+            &path,
+            r#"{"ip":"127.0.0.1","module_specific":{"default_timeout_secs":900,"channel":"x"}}"#,
+        )
+        .unwrap();
+        backfill_adapter_config_defaults_at(&path);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["ip"], "127.0.0.1", "top-level field preserved");
+        let ms = root["module_specific"].as_object().unwrap();
+        assert_eq!(ms["default_timeout_secs"], 900, "existing value preserved");
+        assert_eq!(ms["channel"], "x", "non-tunable key preserved");
+        assert_eq!(ms["prompt_timeout_secs"], 300, "missing key backfilled");
+        assert_eq!(ms.len(), 10);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
