@@ -90,6 +90,12 @@ struct TwitchAdapterConfig {
     irc_connect_retry_secs: u64,
     cred_rejection_cooldown_secs: u64,
     irc_reconnect_delay_secs: u64,
+    #[serde(default = "default_stream_poll_interval_secs")]
+    stream_poll_interval_secs: u64,
+}
+
+fn default_stream_poll_interval_secs() -> u64 {
+    30
 }
 
 impl Default for TwitchAdapterConfig {
@@ -108,6 +114,7 @@ impl Default for TwitchAdapterConfig {
             irc_connect_retry_secs: 5,
             cred_rejection_cooldown_secs: 2,
             irc_reconnect_delay_secs: 5,
+            stream_poll_interval_secs: 30,
         }
     }
 }
@@ -255,7 +262,7 @@ fn backfill_adapter_config_defaults_at(path: &std::path::Path) {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i64); 9] = [
+    let defaults: [(&str, i64); 10] = [
         ("default_timeout_secs", 300),
         ("prompt_timeout_secs", 300),
         ("oauth_capture_timeout_secs", 120),
@@ -265,6 +272,7 @@ fn backfill_adapter_config_defaults_at(path: &std::path::Path) {
         ("irc_connect_retry_secs", 5),
         ("cred_rejection_cooldown_secs", 2),
         ("irc_reconnect_delay_secs", 5),
+        ("stream_poll_interval_secs", 30),
     ];
     for (key, value) in defaults {
         if ms.get(key).is_none() {
@@ -711,6 +719,101 @@ async fn channel_exists(
         .and_then(|d| d.as_array())
         .map(|arr| !arr.is_empty())
         .unwrap_or(false)
+}
+
+/// Build the exact `[stream-start]` event message for a channel that just went
+/// live. `started_at` is Twitch's ISO 8601 UTC string, used verbatim.
+fn stream_start_message(channel: &str, started_at: &str, title: &str) -> String {
+    format!(
+        "[stream-start] twitch: channel '{}' went live at {} — title: \"{}\"",
+        channel, started_at, title
+    )
+}
+
+/// Parse a Helix `/streams` response body into the channel's live status.
+/// `Ok(Some((started_at, title)))` when live, `Ok(None)` when offline, `Err`
+/// when the body is not the expected shape.
+fn parse_stream_status(
+    body: &serde_json::Value,
+) -> Result<Option<(String, String)>, ()> {
+    let data = body.get("data").and_then(|d| d.as_array()).ok_or(())?;
+    let Some(entry) = data.first() else { return Ok(None) };
+    let started_at = entry
+        .get("started_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = entry
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(Some((started_at, title)))
+}
+
+/// Poll Twitch Helix for the channel's live status and emit a `[stream-start]`
+/// event (broadcast to the engine + persisted to the timeline) on the
+/// offline→online transition. The write half and engine identity are read from
+/// the shared handles at send time so a reconnect always uses current creds.
+/// Failed polls (network/HTTP/parse) are skipped silently — never spam logs on
+/// a transient blip.
+async fn stream_poll_task(
+    channel: String,
+    client_id: String,
+    oauth_token: String,
+    poll_interval_secs: u64,
+    http_client: reqwest::Client,
+    write_ws: Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
+) {
+    let mut was_live = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))).await;
+        let res = http_client
+            .get(format!(
+                "https://api.twitch.tv/helix/streams?user_login={}",
+                channel
+            ))
+            .header("Client-Id", &client_id)
+            .header("Authorization", format!("Bearer {}", oauth_token))
+            .send()
+            .await;
+        let Ok(res) = res else { continue };
+        if !res.status().is_success() {
+            continue;
+        }
+        let Ok(body) = res.json::<serde_json::Value>().await else { continue };
+        let Ok(status) = parse_stream_status(&body) else { continue };
+        match status {
+            Some((started_at, title)) => {
+                if !was_live {
+                    was_live = true;
+                    let msg = stream_start_message(&channel, &started_at, &title);
+                    info!("{}", msg);
+                    let (auth, module, instance) = {
+                        let id = identity.lock().await;
+                        (id.auth.clone(), id.module.clone(), id.instance.clone())
+                    };
+                    let log = Container {
+                        version: 1,
+                        auth_token: auth,
+                        module_name: module,
+                        module_instance_uuid7: instance,
+                        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+                            log: msg,
+                            blob: vec![],
+                        })),
+                    };
+                    let mut buf = Vec::new();
+                    if log.encode(&mut buf).is_ok() {
+                        let mut w = write_ws.lock().await;
+                        let _ = w.send(WsMessage::Binary(buf)).await;
+                    }
+                }
+            }
+            None => was_live = false,
+        }
+    }
 }
 
 #[tokio::main]
@@ -1364,6 +1467,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // ── Live-stream detection ─────────────────────────────────────────────
+    // Poll Helix for the channel's live status and emit a stream-start event
+    // on the offline→online transition. Requires a real oauth token — an
+    // anonymous read-only (justinfan) setup has none and is skipped.
+    if !channel.is_empty() && !oauth_token.trim().is_empty() && !client_id.trim().is_empty() {
+        info!(
+            "Starting live-stream poll for channel '{}' every {}s",
+            channel, adapter_config.stream_poll_interval_secs
+        );
+        tokio::spawn(stream_poll_task(
+            channel.clone(),
+            client_id.clone(),
+            oauth_token.clone(),
+            adapter_config.stream_poll_interval_secs,
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_default(),
+            write_ws_cockatiel.clone(),
+            identity.clone(),
+        ));
+    } else {
+        info!(
+            "Live-stream detection skipped for channel '{}' (no real oauth token — anonymous/read-only)",
+            channel
+        );
+    }
+
     let twitch_ws_url = "wss://irc-ws.chat.twitch.tv:443";
 
         'reconnect: loop {
@@ -1606,7 +1737,8 @@ mod tests {
         assert_eq!(ms["irc_connect_retry_secs"], 5);
         assert_eq!(ms["cred_rejection_cooldown_secs"], 2);
         assert_eq!(ms["irc_reconnect_delay_secs"], 5);
-        assert_eq!(ms.len(), 9, "all tuning defaults present");
+        assert_eq!(ms["stream_poll_interval_secs"], 30);
+        assert_eq!(ms.len(), 10, "all tuning defaults present");
 
         // Existing values preserved, missing keys added, top-level fields survive.
         std::fs::write(
@@ -1622,9 +1754,40 @@ mod tests {
         assert_eq!(ms["default_timeout_secs"], 900, "existing value preserved");
         assert_eq!(ms["channel"], "x", "non-tunable key preserved");
         assert_eq!(ms["prompt_timeout_secs"], 300, "missing key backfilled");
-        assert_eq!(ms.len(), 10);
+        assert_eq!(ms.len(), 11);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_start_message_formats_exactly() {
+        assert_eq!(
+            stream_start_message("vulbyte", "2026-09-24T12:00:00Z", "hello world"),
+            "[stream-start] twitch: channel 'vulbyte' went live at 2026-09-24T12:00:00Z — title: \"hello world\""
+        );
+    }
+
+    #[test]
+    fn stream_start_message_defaults_missing_title() {
+        assert_eq!(
+            stream_start_message("vulbyte", "2026-09-24T12:00:00Z", ""),
+            "[stream-start] twitch: channel 'vulbyte' went live at 2026-09-24T12:00:00Z — title: \"\""
+        );
+    }
+
+    #[test]
+    fn parse_stream_status_detects_live_offline_and_malformed() {
+        let live = serde_json::json!({"data": [{"started_at": "2026-09-24T12:00:00Z", "title": "hi"}]});
+        assert_eq!(
+            parse_stream_status(&live).unwrap(),
+            Some(("2026-09-24T12:00:00Z".to_string(), "hi".to_string()))
+        );
+
+        let offline = serde_json::json!({"data": []});
+        assert_eq!(parse_stream_status(&offline).unwrap(), None);
+
+        let malformed = serde_json::json!({"foo": "bar"});
+        assert!(parse_stream_status(&malformed).is_err());
     }
 
     #[test]
