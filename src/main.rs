@@ -695,30 +695,118 @@ async fn prompt_tie_choice(
     }
 }
 
-/// Check whether a Twitch channel exists via the Helix users endpoint. Returns
-/// true when the API responds 200 with a non-empty `data` array.
+/// Why a channel existence check failed. The distinction matters: an expired or
+/// revoked OAuth token and a genuinely missing channel both used to collapse
+/// into `false`, so a credentials problem was reported to the operator as
+/// "Channel 'vulbyte' does not exist on Twitch."
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelCheckError {
+    /// HTTP 401/403 — the Client-Id or OAuth token is missing, expired, or
+    /// revoked. The channel was never actually checked.
+    InvalidCredentials { status: u16, detail: String },
+    /// HTTP 429 — rate limited; the channel was never actually checked.
+    RateLimited,
+    /// Any other non-2xx (5xx and friends).
+    Server { status: u16 },
+    /// DNS/TLS/connect/timeout — Twitch was never reached.
+    Transport { detail: String },
+}
+
+impl std::fmt::Display for ChannelCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelCheckError::InvalidCredentials { status, detail } => write!(
+                f,
+                "Twitch rejected the configured credentials (HTTP {}: {}). The channel was NOT \
+                 checked — re-authorize the adapter (Client-Id from dev.twitch.tv, and a fresh \
+                 OAuth token) and try again",
+                status, detail
+            ),
+            ChannelCheckError::RateLimited => write!(
+                f,
+                "Twitch is rate limiting us (HTTP 429). The channel was NOT checked — try again shortly"
+            ),
+            ChannelCheckError::Server { status } => write!(
+                f,
+                "Twitch API returned HTTP {}. The channel was NOT checked — try again shortly",
+                status
+            ),
+            ChannelCheckError::Transport { detail } => write!(
+                f,
+                "could not reach api.twitch.tv: {}. The channel was NOT checked",
+                detail
+            ),
+        }
+    }
+}
+
+/// What the setup phase concluded about the configured channel.
+///
+/// This is the single place the three outcomes are kept distinct, so no path
+/// can report an unknown (credentials/network) result as a missing channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelVerdict {
+    /// Twitch confirmed the channel exists.
+    Valid,
+    /// Twitch answered and said the channel does not exist.
+    Missing,
+    /// The check never completed. The channel's existence is UNKNOWN and must
+    /// not be reported either way.
+    Unknown(String),
+}
+
+fn channel_verdict(res: Result<bool, ChannelCheckError>) -> ChannelVerdict {
+    match res {
+        Ok(true) => ChannelVerdict::Valid,
+        Ok(false) => ChannelVerdict::Missing,
+        Err(e) => ChannelVerdict::Unknown(e.to_string()),
+    }
+}
+
+/// Check whether a Twitch channel exists via the Helix users endpoint.
+///
+/// `Ok(true)` — Twitch answered 200 with a non-empty `data` array: the channel
+/// exists. `Ok(false)` — Twitch answered 200 with an EMPTY `data` array: the
+/// channel genuinely does not exist. `Err` — the check never completed, so the
+/// channel's existence is unknown and must not be reported either way.
 async fn channel_exists(
     client: &reqwest::Client,
     client_id: &str,
     oauth: &str,
     channel: &str,
-) -> bool {
+) -> Result<bool, ChannelCheckError> {
     let res = client
         .get(format!("https://api.twitch.tv/helix/users?login={}", channel))
         .header("Client-Id", client_id)
         .header("Authorization", format!("Bearer {}", oauth))
         .send()
         .await
-        .ok();
-    let Some(res) = res else { return false; };
+        .map_err(|e| ChannelCheckError::Transport { detail: e.to_string() })?;
+    let status = res.status().as_u16();
     if !res.status().is_success() {
-        return false;
+        // Twitch puts the reason in a `message` field; surface it rather than
+        // guessing, since "Invalid OAuth token" and "OAuth token is missing"
+        // call for very different fixes.
+        let detail = res.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&detail)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("HTTP {}", status));
+        return Err(match status {
+            401 | 403 => ChannelCheckError::InvalidCredentials { status, detail },
+            429 => ChannelCheckError::RateLimited,
+            other => ChannelCheckError::Server { status: other },
+        });
     }
-    let Ok(json) = res.json::<serde_json::Value>().await else { return false; };
-    json.get("data")
+    let json = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| ChannelCheckError::Transport { detail: e.to_string() })?;
+    Ok(json
+        .get("data")
         .and_then(|d| d.as_array())
         .map(|arr| !arr.is_empty())
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 /// Build the exact `[stream-start]` event message for a channel that just went
@@ -1342,95 +1430,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break 'validate;
             }
 
-            if channel_exists(&http_client, &client_id, &oauth_token, &channel).await {
-                setup_log.push_str(&format!("channel '{}' is valid\n", channel));
-                break 'validate;
-            }
-
-            let subject = format!("Channel '{}' does not exist on Twitch.", channel);
-            let choice = prompt_tie_choice(
-                &write_ws_cockatiel,
-                &mut prompt_rx,
-                &auth_token,
-                &module_name,
-                &instance_uuid,
-                &subject,
-                adapter_config.prompt_timeout_secs,
-            )
-            .await;
-            match choice {
-                Some(TieChoice::Retry) => continue 'validate,
-                Some(TieChoice::Ignore) => {
-                    setup_log.push_str(&format!(
-                        "channel '{}' invalid — ignored (will retry at runtime)\n",
-                        channel
-                    ));
+            // Ok(true) = Twitch confirmed the channel. Ok(false) = Twitch answered
+            // and said no. Err = the check never completed, so we know NOTHING
+            // about the channel and must not report it as missing.
+            match channel_verdict(channel_exists(&http_client, &client_id, &oauth_token, &channel).await)
+            {
+                ChannelVerdict::Valid => {
+                    setup_log.push_str(&format!("channel '{}' is valid\n", channel));
                     break 'validate;
                 }
-                Some(TieChoice::Remove) => {
-                    setup_log.push_str(&format!("channel '{}' invalid — removed\n", channel));
-                    if let Some(val) = prompt_for_input(
+                ChannelVerdict::Missing => {
+                    let subject = format!("Channel '{}' does not exist on Twitch.", channel);
+                    let choice = prompt_tie_choice(
                         &write_ws_cockatiel,
                         &mut prompt_rx,
                         &auth_token,
                         &module_name,
                         &instance_uuid,
-                        "Twitch Live Chat Configuration Required",
-                        "Enter the Twitch channel name or stream link to connect to.",
-                        "Twitch channel name or stream link",
-                        PromptKind::String,
+                        &subject,
                         adapter_config.prompt_timeout_secs,
                     )
-                    .await
-                    {
-                        let trimmed = val.trim();
-                        if let Some(idx) = trimmed.find("twitch.tv/") {
-                            channel = trimmed[idx + 10..]
-                                .split('/')
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                        } else {
-                            channel = trimmed.to_string();
+                    .await;
+                    match choice {
+                        Some(TieChoice::Retry) => continue 'validate,
+                        Some(TieChoice::Ignore) => {
+                            setup_log.push_str(&format!(
+                                "channel '{}' invalid — ignored (will retry at runtime)\n",
+                                channel
+                            ));
+                            break 'validate;
                         }
-                        continue 'validate;
-                    }
-                    break 'validate;
-                }
-                Some(TieChoice::Edit) => {
-                    if let Some(val) = prompt_for_input(
-                        &write_ws_cockatiel,
-                        &mut prompt_rx,
-                        &auth_token,
-                        &module_name,
-                        &instance_uuid,
-                        "Edit Twitch Channel",
-                        "Enter the corrected Twitch channel name or stream link.",
-                        "Twitch channel name or stream link",
-                        PromptKind::String,
-                        adapter_config.prompt_timeout_secs,
-                    )
-                    .await
-                    {
-                        let trimmed = val.trim();
-                        if let Some(idx) = trimmed.find("twitch.tv/") {
-                            channel = trimmed[idx + 10..]
-                                .split('/')
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                        } else {
-                            channel = trimmed.to_string();
+                        Some(TieChoice::Remove) => {
+                            setup_log.push_str(&format!("channel '{}' invalid — removed\n", channel));
+                            if let Some(val) = prompt_for_input(
+                                &write_ws_cockatiel,
+                                &mut prompt_rx,
+                                &auth_token,
+                                &module_name,
+                                &instance_uuid,
+                                "Twitch Live Chat Configuration Required",
+                                "Enter the Twitch channel name or stream link to connect to.",
+                                "Twitch channel name or stream link",
+                                PromptKind::String,
+                                adapter_config.prompt_timeout_secs,
+                            )
+                            .await
+                            {
+                                let trimmed = val.trim();
+                                if let Some(idx) = trimmed.find("twitch.tv/") {
+                                    channel = trimmed[idx + 10..]
+                                        .split('/')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                } else {
+                                    channel = trimmed.to_string();
+                                }
+                                continue 'validate;
+                            }
+                            break 'validate;
                         }
-                        continue 'validate;
+                        Some(TieChoice::Edit) => {
+                            if let Some(val) = prompt_for_input(
+                                &write_ws_cockatiel,
+                                &mut prompt_rx,
+                                &auth_token,
+                                &module_name,
+                                &instance_uuid,
+                                "Edit Twitch Channel",
+                                "Enter the corrected Twitch channel name or stream link.",
+                                "Twitch channel name or stream link",
+                                PromptKind::String,
+                                adapter_config.prompt_timeout_secs,
+                            )
+                            .await
+                            {
+                                let trimmed = val.trim();
+                                if let Some(idx) = trimmed.find("twitch.tv/") {
+                                    channel = trimmed[idx + 10..]
+                                        .split('/')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                } else {
+                                    channel = trimmed.to_string();
+                                }
+                                continue 'validate;
+                            }
+                            break 'validate;
+                        }
+                        None => {
+                            setup_log.push_str(&format!(
+                                "channel '{}' invalid — skipped (cancelled)\n",
+                                channel
+                            ));
+                            break 'validate;
+                        }
                     }
-                    break 'validate;
                 }
-                None => {
-                    setup_log.push_str(&format!(
-                        "channel '{}' invalid — skipped (cancelled)\n",
-                        channel
-                    ));
+                ChannelVerdict::Unknown(cause) => {
+                    // Never report a credentials or network problem as a missing channel.
+                    error!("Twitch channel check failed: {}", cause);
+                    setup_log.push_str(&format!("channel check failed: {}\n", cause));
                     break 'validate;
                 }
             }
@@ -1827,5 +1928,136 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod channel_check_tests {
+    use super::{ChannelCheckError, ChannelVerdict, channel_verdict};
+
+    /// The reported bug: a 401 from Twitch (expired/revoked OAuth token) was
+    /// reported to the operator as "Channel 'vulbyte' does not exist on Twitch."
+    /// The message must now name the real cause and say the channel was NOT
+    /// checked, so nobody goes hunting for a channel that exists.
+    #[test]
+    fn a_credentials_failure_never_blames_the_channel() {
+        let msg = ChannelCheckError::InvalidCredentials {
+            status: 401,
+            detail: "Invalid OAuth token".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("401"), "should carry the status: {msg}");
+        assert!(msg.contains("Invalid OAuth token"), "should carry Twitch's own reason: {msg}");
+        assert!(msg.contains("NOT"), "must say the channel was not checked: {msg}");
+        assert!(
+            !msg.contains("does not exist"),
+            "must never claim the channel is missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_missing_token_is_distinguished_from_an_invalid_one() {
+        let missing = ChannelCheckError::InvalidCredentials {
+            status: 401,
+            detail: "OAuth token is missing".to_string(),
+        }
+        .to_string();
+        let invalid = ChannelCheckError::InvalidCredentials {
+            status: 401,
+            detail: "Invalid OAuth token".to_string(),
+        }
+        .to_string();
+        assert_ne!(missing, invalid, "Twitch's reason must survive to the operator");
+        assert!(missing.contains("missing"));
+    }
+
+    #[test]
+    fn every_transient_failure_also_says_the_channel_was_not_checked() {
+        for e in [
+            ChannelCheckError::RateLimited,
+            ChannelCheckError::Server { status: 503 },
+            ChannelCheckError::Transport { detail: "dns failure".to_string() },
+        ] {
+            let msg = e.to_string();
+            assert!(msg.contains("NOT"), "should say not-checked: {msg}");
+            assert!(!msg.contains("does not exist"), "must not blame the channel: {msg}");
+        }
+    }
+
+    /// The reported bug, end to end: whatever Twitch or the network does, an
+    /// unknown outcome must never be reported as a missing channel.
+    #[test]
+    fn an_unknown_outcome_is_never_a_missing_channel() {
+        let unknowns = [
+            ChannelVerdict::Unknown(
+                ChannelCheckError::InvalidCredentials {
+                    status: 401,
+                    detail: "Invalid OAuth token".to_string(),
+                }
+                .to_string(),
+            ),
+            ChannelVerdict::Unknown(ChannelCheckError::RateLimited.to_string()),
+            ChannelVerdict::Unknown(
+                ChannelCheckError::Transport { detail: "dns failure".to_string() }.to_string(),
+            ),
+        ];
+        for v in unknowns {
+            assert!(matches!(v, ChannelVerdict::Unknown(_)));
+            let text = match &v {
+                ChannelVerdict::Unknown(m) => m.clone(),
+                _ => unreachable!(),
+            };
+            assert!(
+                !text.contains("does not exist"),
+                "an unknown outcome told the operator their channel is missing: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_outcomes_stay_distinct() {
+        assert_eq!(
+            channel_verdict(Ok(true)),
+            ChannelVerdict::Valid,
+            "a confirmed channel is Valid"
+        );
+        assert_eq!(
+            channel_verdict(Ok(false)),
+            ChannelVerdict::Missing,
+            "only a definitive 200-with-empty-data is Missing"
+        );
+        // Every error becomes Unknown, never Missing.
+        for e in [
+            ChannelCheckError::InvalidCredentials { status: 401, detail: "x".into() },
+            ChannelCheckError::InvalidCredentials { status: 403, detail: "x".into() },
+            ChannelCheckError::RateLimited,
+            ChannelCheckError::Server { status: 500 },
+            ChannelCheckError::Transport { detail: "x".into() },
+        ] {
+            let v = channel_verdict(Err(e));
+            assert!(
+                matches!(v, ChannelVerdict::Unknown(_)),
+                "{:?} must not be reported as a missing channel",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn the_setup_loop_matches_on_the_verdict_not_on_the_raw_result() {
+        // The call site must branch on ChannelVerdict, so `Missing` is
+        // syntactically unreachable from an error.
+        let src = include_str!("main.rs");
+        let start = src
+            .find("match channel_verdict(channel_exists(")
+            .expect("call site must branch on the verdict");
+        let arm = &src[start..start + 6000];
+        assert!(arm.contains("ChannelVerdict::Missing"), "Missing arm missing");
+        assert!(arm.contains("ChannelVerdict::Unknown"), "Unknown arm missing");
+        assert!(
+            !arm.contains("Ok(false) =>"),
+            "the loop must not branch on the raw Result any more"
+        );
     }
 }
