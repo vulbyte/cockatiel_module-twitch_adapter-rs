@@ -818,12 +818,56 @@ fn stream_start_message(channel: &str, started_at: &str, title: &str) -> String 
     )
 }
 
+/// Push this channel's current viewer count to the engine via a `ChannelStats`
+/// payload. The engine stores it and serves it to other modules through the
+/// `channel_viewers` virtual query. Reads the session identity at send time.
+async fn push_channel_stats(
+    write_ws: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    platform: &str,
+    channel: &str,
+    viewers: i64,
+    is_live: bool,
+    title: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+            platform: platform.to_string(),
+            channel: channel.to_string(),
+            viewers,
+            is_live,
+            title: title.to_string(),
+            updated_at: now_unix_millis(),
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_ws.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Parse a Helix `/streams` response body into the channel's live status.
-/// `Ok(Some((started_at, title)))` when live, `Ok(None)` when offline, `Err`
-/// when the body is not the expected shape.
+/// `Ok(Some((started_at, title, viewers)))` when live, `Ok(None)` when
+/// offline, `Err` when the body is not the expected shape.
 fn parse_stream_status(
     body: &serde_json::Value,
-) -> Result<Option<(String, String)>, ()> {
+) -> Result<Option<(String, String, i64)>, ()> {
     let data = body.get("data").and_then(|d| d.as_array()).ok_or(())?;
     let Some(entry) = data.first() else { return Ok(None) };
     let started_at = entry
@@ -836,7 +880,11 @@ fn parse_stream_status(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(Some((started_at, title)))
+    let viewers = entry
+        .get("viewer_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Ok(Some((started_at, title, viewers)))
 }
 
 /// Poll Twitch Helix for the channel's live status and emit a `[stream-start]`
@@ -873,7 +921,19 @@ async fn stream_poll_task(
         let Ok(body) = res.json::<serde_json::Value>().await else { continue };
         let Ok(status) = parse_stream_status(&body) else { continue };
         match status {
-            Some((started_at, title)) => {
+            Some((started_at, title, viewers)) => {
+                // Push the current viewer count to the engine on every poll so
+                // other modules can read it via the `channel_viewers` query.
+                push_channel_stats(
+                    &write_ws,
+                    &identity,
+                    "twitch",
+                    &channel,
+                    viewers,
+                    true,
+                    &title,
+                )
+                .await;
                 if !was_live {
                     was_live = true;
                     let msg = stream_start_message(&channel, &started_at, &title);
@@ -899,7 +959,21 @@ async fn stream_poll_task(
                     }
                 }
             }
-            None => was_live = false,
+            None => {
+                // Offline: report a zero viewer count so consumers see the
+                // channel went dark, and clear the live-transition latch.
+                push_channel_stats(
+                    &write_ws,
+                    &identity,
+                    "twitch",
+                    &channel,
+                    0,
+                    false,
+                    "",
+                )
+                .await;
+                was_live = false;
+            }
         }
     }
 }
@@ -1878,10 +1952,25 @@ mod tests {
 
     #[test]
     fn parse_stream_status_detects_live_offline_and_malformed() {
-        let live = serde_json::json!({"data": [{"started_at": "2026-09-24T12:00:00Z", "title": "hi"}]});
+        let live = serde_json::json!({"data": [{"started_at": "2026-09-24T12:00:00Z", "title": "hi", "viewer_count": 4321}]});
         assert_eq!(
             parse_stream_status(&live).unwrap(),
-            Some(("2026-09-24T12:00:00Z".to_string(), "hi".to_string()))
+            Some((
+                "2026-09-24T12:00:00Z".to_string(),
+                "hi".to_string(),
+                4321
+            ))
+        );
+
+        let live_no_count = serde_json::json!({"data": [{"started_at": "2026-09-24T12:00:00Z", "title": "hi"}]});
+        assert_eq!(
+            parse_stream_status(&live_no_count).unwrap(),
+            Some((
+                "2026-09-24T12:00:00Z".to_string(),
+                "hi".to_string(),
+                0
+            )),
+            "a missing viewer_count defaults to 0"
         );
 
         let offline = serde_json::json!({"data": []});
