@@ -84,20 +84,20 @@ struct TwitchAdapterConfig {
     oauth_token: Option<String>,
     username: Option<String>,
     client_id: Option<String>,
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
     prompt_timeout_secs: u32,
     oauth_capture_timeout_secs: u32,
     outbound_queue_cap: usize,
-    reconnect_base_secs: u64,
-    reconnect_max_secs: u64,
-    irc_connect_retry_secs: u64,
-    cred_rejection_cooldown_secs: u64,
-    irc_reconnect_delay_secs: u64,
+    reconnect_base_secs: u32,
+    reconnect_max_secs: u32,
+    irc_connect_retry_secs: u32,
+    cred_rejection_cooldown_secs: u32,
+    irc_reconnect_delay_secs: u32,
     #[serde(default = "default_stream_poll_interval_secs")]
-    stream_poll_interval_secs: u64,
+    stream_poll_interval_secs: u32,
 }
 
-fn default_stream_poll_interval_secs() -> u64 {
+fn default_stream_poll_interval_secs() -> u32 {
     30
 }
 
@@ -172,7 +172,7 @@ fn build_mod_query(
     command_name: &str,
     message: &str,
     author: &str,
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
 ) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.trim().split_whitespace();
     // The command word itself (the engine verified + routed it).
@@ -203,7 +203,7 @@ fn build_mod_query(
             let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
-                if let Ok(secs) = d.parse::<i64>() {
+                if let Ok(secs) = d.parse::<i32>() {
                     duration_secs = secs;
                 } else {
                     reason = d.to_string();
@@ -265,7 +265,7 @@ fn backfill_adapter_config_defaults_at(path: &std::path::Path) {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i64); 10] = [
+    let defaults: [(&str, i32); 10] = [
         ("default_timeout_secs", 300),
         ("prompt_timeout_secs", 300),
         ("oauth_capture_timeout_secs", 120),
@@ -829,7 +829,7 @@ async fn push_channel_stats(
     identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
     platform: &str,
     channel: &str,
-    viewers: i64,
+    viewers: i32,
     is_live: bool,
     title: &str,
 ) {
@@ -845,7 +845,7 @@ async fn push_channel_stats(
         payload: Some(EnginePayload::ChannelStats(cockatiel_client::proto::ChannelStats {
             platform: platform.to_string(),
             channel: channel.to_string(),
-            viewers,
+            viewers: viewers as i64,
             is_live,
             title: title.to_string(),
             updated_at: now_unix_millis(),
@@ -870,7 +870,7 @@ fn now_unix_millis() -> i64 {
 /// offline, `Err` when the body is not the expected shape.
 fn parse_stream_status(
     body: &serde_json::Value,
-) -> Result<Option<(String, String, i64)>, ()> {
+) -> Result<Option<(String, String, i32)>, ()> {
     let data = body.get("data").and_then(|d| d.as_array()).ok_or(())?;
     let Some(entry) = data.first() else { return Ok(None) };
     let started_at = entry
@@ -886,6 +886,7 @@ fn parse_stream_status(
     let viewers = entry
         .get("viewer_count")
         .and_then(|v| v.as_i64())
+        .map(|n| n as i32)
         .unwrap_or(0);
     Ok(Some((started_at, title, viewers)))
 }
@@ -900,14 +901,14 @@ async fn stream_poll_task(
     channel: String,
     client_id: String,
     oauth_token: String,
-    poll_interval_secs: u64,
+    poll_interval_secs: u32,
     http_client: reqwest::Client,
     write_ws: Arc<tokio::sync::Mutex<WsWriteHalf>>,
     identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
 ) {
     let mut was_live = false;
     loop {
-        tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))).await;
+        tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1) as u64)).await;
         let res = http_client
             .get(format!(
                 "https://api.twitch.tv/helix/streams?user_login={}",
@@ -1200,7 +1201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Engine disconnected — reconnecting...");
             let mut backoff = reconnect_base_secs;
             loop {
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                 match CockatielClient::connect("config.json").await {
                     Ok(conn) => {
                         info!("Reconnected to engine");
@@ -1705,7 +1706,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         adapter_config.irc_connect_retry_secs
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        adapter_config.irc_connect_retry_secs,
+                        adapter_config.irc_connect_retry_secs as u64,
                     ))
                     .await;
                     continue 'reconnect;
@@ -1774,7 +1775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     env_channel.clear();
                                     env_oauth.clear();
                                     tokio::time::sleep(std::time::Duration::from_secs(
-                                        adapter_config.cred_rejection_cooldown_secs,
+                                        adapter_config.cred_rejection_cooldown_secs as u64,
                                     ))
                                     .await;
                                     continue 'configure;
@@ -1863,7 +1864,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             adapter_config.irc_reconnect_delay_secs
         );
             tokio::time::sleep(std::time::Duration::from_secs(
-                adapter_config.irc_reconnect_delay_secs,
+                adapter_config.irc_reconnect_delay_secs as u64,
             ))
             .await;
         }
