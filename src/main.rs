@@ -421,8 +421,12 @@ async fn capture_oauth_token_concurrent(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", oauth_redirect_port)).await?;
     let redirect_uri = format!("http://localhost:{}", oauth_redirect_port);
+    // Scopes: chat read/edit for the chat path; channel:manage:broadcast for the
+    // stream manager's title update; channel:manage:schedule for its schedule
+    // update. An already-saved chat-only token must be re-authorized to gain the
+    // two manage scopes (clear TWITCH_OAUTH_TOKEN to force the browser flow).
     let auth_url = format!(
-        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope=chat:read+chat:edit",
+        "https://id.twitch.tv/oauth2/authorize?client_id={}&redirect_uri={}&response_type=token&scope=chat:read+chat:edit+channel:manage:broadcast+channel:manage:schedule",
         client_id, redirect_uri
     );
 
@@ -982,6 +986,294 @@ async fn stream_poll_task(
     }
 }
 
+/// Twitch Helix endpoints used by the stream-control task.
+const HELIX_USERS: &str = "https://api.twitch.tv/helix/users";
+const HELIX_CHANNELS: &str = "https://api.twitch.tv/helix/channels";
+const HELIX_SCHEDULE: &str = "https://api.twitch.tv/helix/schedule";
+const HELIX_SCHEDULE_SEGMENT: &str = "https://api.twitch.tv/helix/schedule/segment";
+
+/// Format epoch seconds as an RFC3339 UTC string (`YYYY-MM-DDTHH:MM:SSZ`), which
+/// is what Helix wants for `start_time`. Howard Hinnant's civil-from-days.
+fn format_utc_iso(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let hh = rem / 3_600;
+    let mm = (rem % 3_600) / 60;
+    let ss = rem % 60;
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y } as u64;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+}
+
+/// The broadcaster's numeric user id from a Helix `/users` body, needed as
+/// `broadcaster_id` on the channel + schedule endpoints.
+fn parse_broadcaster_id(body: &serde_json::Value) -> Option<String> {
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|u| u.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
+/// The id of the first NON-recurring segment in a Helix `/schedule` body — the
+/// one an operator can safely move to a new start time. Recurring segments
+/// cannot have their start changed; an empty schedule has none.
+fn pick_updatable_segment(body: &serde_json::Value) -> Option<String> {
+    body.get("data")
+        .and_then(|d| d.get("segments"))
+        .and_then(|s| s.as_array())
+        .and_then(|segs| {
+            segs.iter()
+                .find(|s| !s.get("is_recurring").and_then(|v| v.as_bool()).unwrap_or(false))
+        })
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Apply the stream control to the Twitch channel: the title via Helix
+/// `/channels` (needs `channel:manage:broadcast`), and the scheduled start via
+/// the schedule-segment API (needs `channel:manage:schedule`). Twitch has no
+/// thumbnail API, so the thumbnail is ignored. Returns a short summary.
+async fn apply_twitch_stream_control(
+    client: &reqwest::Client,
+    client_id: &str,
+    oauth: &str,
+    channel: &str,
+    control: &serde_json::Value,
+) -> Result<String, String> {
+    let title = control.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let scheduled_start_ms = control
+        .get("scheduled_start_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if title.is_empty() && scheduled_start_ms == 0 {
+        return Ok("nothing to apply".to_string());
+    }
+    let auth_header = format!("Bearer {oauth}");
+
+    // Resolve the broadcaster id once (both endpoints need it).
+    let res = client
+        .get(HELIX_USERS)
+        .query(&[("login", channel)])
+        .header("Client-Id", client_id)
+        .header("Authorization", &auth_header)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("users lookup failed: {e}"))?;
+    if !res.status().is_success() {
+        let s = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("users lookup {s}: {text}"));
+    }
+    let body: serde_json::Value = res.json().await.map_err(|e| format!("users parse failed: {e}"))?;
+    let broadcaster_id =
+        parse_broadcaster_id(&body).ok_or_else(|| format!("channel '{channel}' not found"))?;
+
+    let mut applied: Vec<String> = Vec::new();
+
+    if !title.is_empty() {
+        let res = client
+            .patch(HELIX_CHANNELS)
+            .query(&[("broadcaster_id", broadcaster_id.as_str())])
+            .header("Client-Id", client_id)
+            .header("Authorization", &auth_header)
+            .json(&json!({ "title": title }))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("channels update failed: {e}"))?;
+        if !res.status().is_success() {
+            let s = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("channels update {s}: {text}"));
+        }
+        applied.push("title".to_string());
+    }
+
+    if scheduled_start_ms != 0 {
+        apply_twitch_schedule(client, client_id, &auth_header, &broadcaster_id, title, scheduled_start_ms)
+            .await?;
+        applied.push("schedule".to_string());
+    }
+
+    Ok(if applied.is_empty() {
+        "nothing to apply".to_string()
+    } else {
+        format!("set {}", applied.join("+"))
+    })
+}
+
+/// Move the channel's soonest non-recurring schedule segment to `start_ms`, or
+/// create a new segment when the schedule has none. `timezone` is reported as
+/// UTC and the duration defaults to an hour — the absolute `start_time` is what
+/// matters and Twitch requires both fields.
+async fn apply_twitch_schedule(
+    client: &reqwest::Client,
+    client_id: &str,
+    auth_header: &str,
+    broadcaster_id: &str,
+    title: &str,
+    scheduled_start_ms: i64,
+) -> Result<(), String> {
+    let get = client
+        .get(HELIX_SCHEDULE)
+        .query(&[("broadcaster_id", broadcaster_id)])
+        .header("Client-Id", client_id)
+        .header("Authorization", auth_header)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("schedule read failed: {e}"))?;
+    let existing_id = if get.status().is_success() {
+        get.json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|b| pick_updatable_segment(&b))
+    } else {
+        None
+    };
+
+    let payload = json!({
+        "start_time": format_utc_iso((scheduled_start_ms / 1000).max(0) as u64),
+        "timezone": "UTC",
+        "duration": "60",
+        "is_recurring": false,
+        "title": title,
+    });
+
+    let res = match existing_id {
+        Some(id) => {
+            client
+                .patch(HELIX_SCHEDULE_SEGMENT)
+                .query(&[("broadcaster_id", broadcaster_id), ("id", id.as_str())])
+                .header("Client-Id", client_id)
+                .header("Authorization", auth_header)
+                .json(&payload)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+        }
+        None => {
+            client
+                .post(HELIX_SCHEDULE_SEGMENT)
+                .query(&[("broadcaster_id", broadcaster_id)])
+                .header("Client-Id", client_id)
+                .header("Authorization", auth_header)
+                .json(&payload)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+        }
+    }
+    .map_err(|e| format!("schedule write failed: {e}"))?;
+    if !res.status().is_success() {
+        let s = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("schedule write {s}: {text}"));
+    }
+    Ok(())
+}
+
+/// Poll the engine's `stream_schedule` and apply each new revision to the
+/// channel (title via Helix channels, scheduled start via the schedule-segment
+/// API), reporting the result back via `stream_control_status`. The read loop
+/// forwards the schedule results on `schedule_rx`, so the (slow) API calls never
+/// delay the read loop's AuthVerify replies.
+async fn twitch_stream_control_task(
+    creds: Arc<tokio::sync::Mutex<Option<(String, String, String)>>>,
+    poll_interval_secs: u32,
+    write_ws: Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
+    mut schedule_rx: mpsc::Receiver<serde_json::Value>,
+) {
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    let mut last_applied = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(5) as u64)).await;
+        // The credentials are set once `'configure` validates them; until then
+        // (or after a rejection clears them) there is nothing to apply to.
+        let Some((channel, client_id, oauth_token)) = creds.lock().await.clone() else {
+            continue;
+        };
+        let (auth, module, instance) = {
+            let id = identity.lock().await;
+            (id.auth.clone(), id.module.clone(), id.instance.clone())
+        };
+        let query = ContainerForEngine {
+            version: 2,
+            auth_token: auth.clone(),
+            module_name: module.clone(),
+            module_instance_uuid7: instance.clone(),
+            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                query_id: "stream_schedule".to_string(),
+                sql: "{}".to_string(),
+                params: vec![],
+            })),
+        };
+        let mut qbuf = Vec::new();
+        if query.encode(&mut qbuf).is_err() {
+            continue;
+        }
+        {
+            let mut w = write_ws.lock().await;
+            if w.send(WsMessage::Binary(qbuf.into())).await.is_err() {
+                continue;
+            }
+        }
+        let control = match tokio::time::timeout(Duration::from_secs(10), schedule_rx.recv()).await {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let revision = control.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+        if revision == 0 || revision == last_applied {
+            continue;
+        }
+        let (ok, message) =
+            match apply_twitch_stream_control(&http_client, &client_id, &oauth_token, &channel, &control).await {
+                Ok(m) => (true, m),
+                Err(e) => (false, e),
+            };
+        last_applied = revision;
+        info!("[stream-control] rev {} applied={} — {}", revision, ok, message);
+        let status = json!({
+            "platform": "twitch",
+            "revision": revision,
+            "ok": ok,
+            "message": message,
+        });
+        let report = ContainerForEngine {
+            version: 2,
+            auth_token: auth,
+            module_name: module,
+            module_instance_uuid7: instance,
+            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                query_id: "stream_control_status".to_string(),
+                sql: status.to_string(),
+                params: vec![],
+            })),
+        };
+        let mut rbuf = Vec::new();
+        if report.encode(&mut rbuf).is_ok() {
+            let mut w = write_ws.lock().await;
+            let _ = w.send(WsMessage::Binary(rbuf.into())).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -1035,6 +1327,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel for outbound SendToPlatforms messages → Twitch IRC writer.
     let (send_outbound_tx, mut send_outbound_rx) = tokio::sync::mpsc::channel::<String>(outbound_queue_cap);
 
+    // Stream-manager wiring: the read loop forwards `stream_schedule` poll
+    // results into this channel; the stream-control task (spawned once, below)
+    // awaits them, applies the control to the channel and reports the result.
+    // The credentials are published into `schedule_creds` once `'configure`
+    // validates them, because that loop can run more than once.
+    let (schedule_tx, schedule_rx) = mpsc::channel::<serde_json::Value>(8);
+    let schedule_creds: Arc<tokio::sync::Mutex<Option<(String, String, String)>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Channel carrying PromptResponses from the engine to the configure loop,
     // so `prompt_for_input` can await the operator's typed answer.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
@@ -1053,8 +1354,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match msg {
                     Ok(WsMessage::Binary(data)) => {
                         if let Ok(container) = cockatiel_client::proto::ContainerForModule::decode(data.as_ref()) {
-                            info!("Received from engine: {:?}", container.payload.as_ref().map(|p| std::mem::discriminant(p)));
-
                             // Use the CURRENT session identity (a reconnect swaps it).
                             let (auth, instance, module) = {
                                 let id = identity_task.lock().await;
@@ -1181,6 +1480,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let mut w = write_task.lock().await;
                                     let _ = w.send(WsMessage::Binary(abuf)).await;
                                 }
+                            } else if let Some(ModulePayload::DatabaseQueryResult(res)) = container.payload {
+                                // A `stream_schedule` poll result: forward it to
+                                // the stream-control task, which owns the apply.
+                                if res.query_id == "stream_schedule" {
+                                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&res.result_blob) {
+                                        let _ = schedule_tx.try_send(v);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1226,6 +1533,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Stream-control poll task (spawned ONCE — it owns the single schedule
+    // receiver). It reads the channel/credentials from `schedule_creds`, which
+    // `'configure` fills in once they validate.
+    tokio::spawn(twitch_stream_control_task(
+        schedule_creds.clone(),
+        adapter_config.stream_poll_interval_secs,
+        write_ws_cockatiel.clone(),
+        identity.clone(),
+        schedule_rx,
+    ));
 
     // Re-acquire credentials whenever Twitch rejects them (bad channel/oauth).
     // Env vars are read once; on rejection the locals are cleared so the
@@ -1686,11 +2004,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_ws_cockatiel.clone(),
             identity.clone(),
         ));
+
+        // Publish the validated credentials so the (already-spawned) stream
+        // manager task can apply the operator's title / scheduled start.
+        *schedule_creds.lock().await = Some((
+            channel.clone(),
+            client_id.clone(),
+            oauth_token.clone(),
+        ));
     } else {
         info!(
             "Live-stream detection skipped for channel '{}' (no real oauth token — anonymous/read-only)",
             channel
         );
+        // No usable credentials: the stream manager has nothing to apply with.
+        *schedule_creds.lock().await = None;
     }
 
     let twitch_ws_url = "wss://irc-ws.chat.twitch.tv:443";
@@ -1897,6 +2225,39 @@ mod tests {
         assert_eq!(qid, "mod_timeout");
         // An unrouted command name yields nothing.
         assert!(build_mod_query("!help", "!help", "mod", 300).is_none());
+    }
+
+    #[test]
+    fn utc_iso_formats_epochs() {
+        assert_eq!(format_utc_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc_iso(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(format_utc_iso(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn broadcaster_id_reads_the_first_user() {
+        let body = json!({ "data": [{ "id": "44322889", "login": "dallas" }] });
+        assert_eq!(parse_broadcaster_id(&body).as_deref(), Some("44322889"));
+        assert_eq!(parse_broadcaster_id(&json!({ "data": [] })), None);
+        assert_eq!(parse_broadcaster_id(&json!({})), None);
+    }
+
+    #[test]
+    fn picks_the_first_non_recurring_segment() {
+        let body = json!({
+            "data": {
+                "segments": [
+                    { "id": "seg-rec", "is_recurring": true },
+                    { "id": "seg-1", "is_recurring": false },
+                    { "id": "seg-2", "is_recurring": false },
+                ]
+            }
+        });
+        assert_eq!(pick_updatable_segment(&body).as_deref(), Some("seg-1"));
+        // All recurring (or none) → nothing to update (create a new segment).
+        let all_rec = json!({ "data": { "segments": [{ "id": "x", "is_recurring": true }] } });
+        assert_eq!(pick_updatable_segment(&all_rec), None);
+        assert_eq!(pick_updatable_segment(&json!({ "data": {} })), None);
     }
 
     #[test]
