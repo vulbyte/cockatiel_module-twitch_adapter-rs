@@ -1488,6 +1488,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = schedule_tx.try_send(v);
                                     }
                                 }
+                            } else if let Some(ModulePayload::Shutdown(_)) = container.payload {
+                                info!("Engine requested shutdown — exiting");
+                                std::process::exit(0);
                             }
                         }
                     }
