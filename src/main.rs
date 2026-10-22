@@ -326,6 +326,21 @@ fn ensure_env_file_at(path: &std::path::Path) {
     }
 }
 
+/// Acquire an exclusive, OS-level lock in the module's config dir so two
+/// adapter instances can't race the same Twitch nick (the engine evicts one).
+/// The lock is held by the returned `File` for the process lifetime and is
+/// released automatically by the OS on exit — even on a crash — so a stale
+/// lock can never wedge a restart.
+fn acquire_single_instance_lock() -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(".twitch-adapter.lock")?;
+    file.try_lock()?;
+    Ok(file)
+}
+
 fn load_adapter_config() -> Option<TwitchAdapterConfig> {
     // Secrets live in `.env` (loaded into env at startup); `channel` and
     // `username` are public settings, read from config.json below.
@@ -1285,6 +1300,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Twitch Adapter Module...");
 
+    // Single-instance guard: two adapters racing the same nick get one evicted
+    // by the engine. Hold an OS lock for the process lifetime; a duplicate logs
+    // and exits 0. The lock is released automatically on exit/crash.
+    let _instance_lock: Option<std::fs::File> = match acquire_single_instance_lock() {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            error!(
+                "Another twitch-adapter instance is already running for this config dir — exiting (the engine would evict one anyway)."
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!("Could not acquire the single-instance lock ({e}); continuing without it");
+            None
+        }
+    };
+
     let cockatiel = CockatielClient::connect("config.json").await?;
 
     // Split the stream for concurrent read/write
@@ -1976,14 +2008,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if channel.is_empty() {
-        // A cancelled channel prompt leaves no channel: DON'T enter the
-        // JOIN/reconnect spin (it would send `JOIN #` and reconnect every 5s
-        // forever). Exit cleanly so the supervisor can restart the module once
-        // a configuration exists.
+        // A cancelled/failed prompt (e.g. after a credential rejection) leaves
+        // no channel. NEVER exit on our own here — that made the module silently
+        // disappear when the operator didn't answer. Back off and re-run the
+        // configure phase so it keeps retrying; only an explicit engine
+        // Shutdown ends the module.
         error!(
-            "No Twitch channel configured after setup — exiting cleanly (supervisor will restart once config exists)."
+            "No Twitch channel configured after setup — retrying configuration in {}s (enter a channel/credentials in the UI).",
+            adapter_config.cred_rejection_cooldown_secs
         );
-        return Ok(());
+        tokio::time::sleep(std::time::Duration::from_secs(
+            adapter_config.cred_rejection_cooldown_secs as u64,
+        ))
+        .await;
+        continue 'configure;
     }
 
     // ── Live-stream detection ─────────────────────────────────────────────
@@ -2057,20 +2095,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &username.to_lowercase()
         };
 
-        write_ws
-            .send(WsMessage::Text(format!("PASS {}", pass)))
-            .await?;
-        write_ws
-            .send(WsMessage::Text(format!("NICK {}", nick)))
-            .await?;
-        write_ws
-            .send(WsMessage::Text(format!("JOIN #{}", channel.to_lowercase())))
-            .await?;
-        write_ws
-            .send(WsMessage::Text(
-                "CAP req :twitch.tv/tags twitch.tv/commands".to_string(),
+        // The handshake writes MUST NOT use `?` here: an error would propagate
+        // out of `main` and kill the module. On any write failure, log and fall
+        // into the IRC reconnect path instead.
+        let handshake = async {
+            write_ws
+                .send(WsMessage::Text(format!("PASS {}", pass)))
+                .await?;
+            write_ws
+                .send(WsMessage::Text(format!("NICK {}", nick)))
+                .await?;
+            write_ws
+                .send(WsMessage::Text(format!("JOIN #{}", channel.to_lowercase())))
+                .await?;
+            write_ws
+                .send(WsMessage::Text(
+                    "CAP req :twitch.tv/tags twitch.tv/commands".to_string(),
+                ))
+                .await?;
+            Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+        }
+        .await;
+        if let Err(e) = handshake {
+            warn!(
+                "Twitch IRC handshake failed: {}. Reconnecting in {} seconds...",
+                e, adapter_config.irc_connect_retry_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(
+                adapter_config.irc_connect_retry_secs as u64,
             ))
-            .await?;
+            .await;
+            continue 'reconnect;
+        }
 
         info!(
             "Successfully connected to Twitch channel #{} as nick '{}'!",
@@ -2091,7 +2147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     || line.contains("authentication failed")
                                 {
                                     error!(
-                                        "Twitch rejected credentials for channel '{}' ({}). Re-acquiring...",
+                                        "Twitch rejected the credentials — the OAuth token is invalid or expired; re-enter it (channel '{}': {}). Retrying with backoff...",
                                         channel, line
                                     );
                                     force_prompt = true;

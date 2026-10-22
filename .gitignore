@@ -197,3 +197,4 @@ target/
 # Runtime config — contains secrets (tokens/oauth). Never commit.
 config.json
 .env
+.twitch-adapter.lock
