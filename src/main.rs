@@ -739,9 +739,10 @@ impl std::fmt::Display for ChannelCheckError {
         match self {
             ChannelCheckError::InvalidCredentials { status, detail } => write!(
                 f,
-                "Twitch rejected the configured credentials (HTTP {}: {}). The channel was NOT \
-                 checked — re-authorize the adapter (Client-Id from dev.twitch.tv, and a fresh \
-                 OAuth token) and try again",
+                "Twitch could not verify the configured credentials (HTTP {}: {}). The channel \
+                 was NOT checked — re-authorize the adapter (Client-Id from dev.twitch.tv, and a \
+                 fresh OAuth token) and try again. Chat still runs over IRC; this only affects \
+                 API actions (ban/timeout/send)",
                 status, detail
             ),
             ChannelCheckError::RateLimited => write!(
@@ -1980,8 +1981,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ChannelVerdict::Unknown(cause) => {
                     // Never report a credentials or network problem as a missing channel.
-                    error!("Twitch channel check failed: {}", cause);
-                    setup_log.push_str(&format!("channel check failed: {}\n", cause));
+                    // Non-fatal: chat still runs over IRC, so this is a WARNING (a stale
+                    // token only blocks API actions). An ERROR line here would trip the
+                    // TUI's error badge on a module that is working.
+                    warn!("Twitch channel check could not complete: {}", cause);
+                    setup_log.push_str(&format!("channel check could not complete: {}\n", cause));
                     break 'validate;
                 }
             }
